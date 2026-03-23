@@ -40,7 +40,7 @@ export default function Faq() {
   };
 
   return (
-    <section className="relative py-16 px-4" style={{ background: "none" }}>
+    <section className="relative py-16 md:py-24 px-6" style={{ background: "none" }}>
       <div className="max-w-3xl mx-auto">
         {/* Title */}
         <motion.h2
