@@ -229,11 +229,7 @@ pub fn list_markets(env: &Env, start: u64, limit: u32) -> Vec<Market> {
 ///
 /// On success the market's `is_closed` flag is set to `true`, the record is
 /// re-saved to persistent storage, and a `MarketClosed` event is emitted.
-pub fn close_market(
-    env: &Env,
-    caller: Address,
-    market_id: u64,
-) -> Result<(), InsightArenaError> {
+pub fn close_market(env: &Env, caller: Address, market_id: u64) -> Result<(), InsightArenaError> {
     // ── Guard 1: market must exist ────────────────────────────────────────────
     let mut market = get_market(env, market_id)?;
 
