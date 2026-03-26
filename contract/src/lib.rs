@@ -257,7 +257,7 @@ impl InsightArenaContract {
         expires_in_seconds: u64,
     ) -> Result<Symbol, InsightArenaError> {
         invite::generate_invite_code(env, creator, market_id, max_uses, expires_in_seconds)
-    // ── Season / Leaderboard ────────────────────────────────────────────────
+        // ── Season / Leaderboard ────────────────────────────────────────────────
     }
 
     /// List all season IDs which have snapshots available.
