@@ -163,6 +163,23 @@ pub fn emit_market_resolved(env: &Env, market_id: u64, resolved_outcome: Symbol)
     );
 }
 
+/// Calculate price of outcome A in terms of outcome B.
+/// Returns price with 6 decimal precision (multiplied by 1_000_000).
+#[allow(dead_code)]
+fn calculate_price(reserve_a: i128, reserve_b: i128) -> Result<i128, InsightArenaError> {
+    if reserve_a <= 0 || reserve_b <= 0 {
+        return Err(InsightArenaError::InvalidInput);
+    }
+
+    let price = reserve_b
+        .checked_mul(1_000_000)
+        .ok_or(InsightArenaError::Overflow)?
+        .checked_div(reserve_a)
+        .ok_or(InsightArenaError::Overflow)?;
+
+    Ok(price)
+}
+
 // ── Entry-point logic ─────────────────────────────────────────────────────────
 
 /// Create a new prediction market and return its auto-assigned `market_id`.
@@ -506,6 +523,34 @@ mod market_tests {
     use crate::{InsightArenaContract, InsightArenaContractClient, InsightArenaError};
 
     use super::CreateMarketParams;
+
+    #[test]
+    fn test_calculate_price_equal_reserves() {
+        // Reserves: 1000/1000 -> Expected: 1_000_000
+        let price = super::calculate_price(1000, 1000).unwrap();
+        assert_eq!(price, 1_000_000);
+    }
+
+    #[test]
+    fn test_calculate_price_double() {
+        // Reserves: 1000/2000 -> Expected: 2_000_000
+        let price = super::calculate_price(1000, 2000).unwrap();
+        assert_eq!(price, 2_000_000);
+    }
+
+    #[test]
+    fn test_calculate_price_half() {
+        // Reserves: 2000/1000 -> Expected: 500_000
+        let price = super::calculate_price(2000, 1000).unwrap();
+        assert_eq!(price, 500_000);
+    }
+
+    #[test]
+    fn test_calculate_price_precision() {
+        // Reserves: 3000/1000 -> Expected: 333_333
+        let price = super::calculate_price(3000, 1000).unwrap();
+        assert_eq!(price, 333_333);
+    }
 
     /// Register a mock XLM token (Stellar Asset Contract) and return its address.
     fn register_token(env: &Env) -> Address {
