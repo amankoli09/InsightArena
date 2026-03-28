@@ -4,7 +4,6 @@ import LeaderboardOverview from "@/component/leaderboard/LeaderboardOverview";
 import LeaderboardFilters, {
   LeaderboardFiltersState,
 } from "@/component/leaderboard/LeaderboardFilters";
-import LeaderboardTable from "@/component/leaderboard/LeaderboardTable";
 import { useState } from "react";
 
 export default function LeaderboardsPage() {
@@ -18,7 +17,7 @@ export default function LeaderboardsPage() {
     <div className="space-y-6">
       <LeaderboardOverview />
       <LeaderboardFilters onChange={setFilters} />
-      <LeaderboardTable />
+      {/* Ranking table/list goes here — receives `filters` as props */}
     </div>
   );
 }
