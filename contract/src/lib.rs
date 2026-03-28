@@ -1,29 +1,31 @@
 #![no_std]
-#![allow(non_snake_case)]
 
-// 1. Register all modules as per Expected Structure
-mod config;
-mod errors;
-mod escrow;
-mod events;
-mod invite;
-mod leaderboard;
-mod market;
-mod oracle;
-mod prediction;
-mod season;
-mod security;
-mod storage_types;
-mod ttl;
-
-// 2. Re-export all public types via 'pub use'
+pub mod analytics;
+pub mod config;
+pub mod dispute;
+pub mod errors;
+pub mod escrow;
+pub mod governance;
+pub mod invite;
+pub mod leaderboard;
+pub mod market;
+pub mod oracle;
+pub mod prediction;
+pub mod reputation;
+pub mod season;
+pub mod security;
+pub mod storage_types;
+pub mod ttl;
+pub use crate::config::Config;
 pub use crate::errors::InsightArenaError;
+pub use crate::governance::{Proposal, ProposalType};
+pub use crate::market::CreateMarketParams;
 pub use crate::storage_types::{
-    Config, DataKey, InviteCode, LeaderboardEntry, LeaderboardSnapshot,
-    Market, Prediction, Season, UserProfile,
+    CreatorStats, DataKey, InviteCode, LeaderboardEntry, LeaderboardSnapshot, Market, MarketStats,
+    PlatformStats, Prediction, Season, UserProfile,
 };
 
-use soroban_sdk::{contract, contractimpl, Address, Env, Symbol, Vec, String};
+use soroban_sdk::{contract, contractimpl, Address, Env, Symbol, Vec};
 
 #[contract]
 pub struct InsightArenaContract;
@@ -45,6 +47,20 @@ impl InsightArenaContract {
     }
 
     /// Transition a market into the "resolved" state by recording the winning outcome.
+    ///
+    /// Validation order:
+    /// 1. `oracle` address must provide valid cryptographic authorisation.
+    /// 2. `oracle` must match the `oracle_address` stored in global configuration.
+    /// 3. Market must exist in persistent storage.
+    /// 4. `current_time >= market.resolution_time` — resolution window must be open.
+    /// 5. `market.is_resolved == false` — prevents double-resolution.
+    /// 6. `resolved_outcome` must be one of the symbols in `market.outcome_options`.
+    ///
+    /// On success:
+    /// - `market.is_resolved` is set to `true`.
+    /// - `market.resolved_outcome` stores the winning `Symbol`.
+    /// - The updated record is saved to storage and its TTL is extended.
+    /// - A `MarketResolved` event is emitted.
     pub fn resolve_market(
         env: Env,
         oracle: Address,
@@ -57,6 +73,7 @@ impl InsightArenaContract {
     // ── Config read ───────────────────────────────────────────────────────────
 
     /// Return the current global [`Config`]. TTL is extended on each call.
+    /// Reverts with `Paused` when the contract is in emergency-halt mode.
     pub fn get_config(env: Env) -> Result<Config, InsightArenaError> {
         config::ensure_not_paused(&env)?;
         config::get_config(&env)
@@ -82,10 +99,14 @@ impl InsightArenaContract {
     // ── Market ────────────────────────────────────────────────────────────────
 
     /// Create a new prediction market. Returns the auto-assigned `market_id`.
+    ///
+    /// All market configuration fields are bundled in [`CreateMarketParams`] to
+    /// stay within Soroban's 10-parameter ABI limit. Reverts with `Paused` when
+    /// the contract is halted, or with a specific validation error on bad input.
     pub fn create_market(
         env: Env,
         creator: Address,
-        params: crate::market::CreateMarketParams,
+        params: CreateMarketParams,
     ) -> Result<u64, InsightArenaError> {
         market::create_market(&env, creator, params)
     }
@@ -134,11 +155,18 @@ impl InsightArenaContract {
     }
 
     /// Return a paginated list of markets in creation order.
+    ///
+    /// - `start`: 1-based market ID to begin from (inclusive).
+    /// - `limit`: maximum markets to return; hard-capped at 50.
+    /// - Returns an empty `Vec` when `start` exceeds the market count.
     pub fn list_markets(env: Env, start: u64, limit: u32) -> Vec<Market> {
         market::list_markets(&env, start, limit)
     }
 
     /// Transition a market into the "closed" state, blocking further predictions.
+    ///
+    /// Can only be called after `market.end_time` has passed. Caller must be the
+    /// platform admin or the configured oracle address. Emits a `MarketClosed` event.
     pub fn close_market(
         env: Env,
         caller: Address,
@@ -148,6 +176,10 @@ impl InsightArenaContract {
     }
 
     /// Cancel a market and refund all stakers.
+    ///
+    /// Only callable by the platform admin. Iterates every `Prediction` record
+    /// stored under `PredictorList(market_id)` and returns each stake via the
+    /// escrow module. Emits a `MarketCancelled` event on success.
     pub fn cancel_market(
         env: Env,
         caller: Address,
@@ -156,9 +188,39 @@ impl InsightArenaContract {
         market::cancel_market(&env, caller, market_id)
     }
 
+    // ── Dispute ───────────────────────────────────────────────────────────────
+
+    /// File a dispute within the market's post-resolution dispute window.
+    /// Locks `bond` in escrow and stores a `Dispute(market_id)` record.
+    pub fn raise_dispute(
+        env: Env,
+        disputer: Address,
+        market_id: u64,
+        bond: i128,
+    ) -> Result<(), InsightArenaError> {
+        dispute::raise_dispute(env, disputer, market_id, bond)
+    }
+
+    /// Resolve an active dispute (admin-only).
+    /// - `uphold=true`: return bond to disputer and reopen market for re-resolution.
+    /// - `uphold=false`: forfeit bond to treasury accounting.
+    pub fn resolve_dispute(
+        env: Env,
+        admin: Address,
+        market_id: u64,
+        uphold: bool,
+    ) -> Result<(), InsightArenaError> {
+        dispute::resolve_dispute(env, admin, market_id, uphold)
+    }
+
     // ── Prediction ────────────────────────────────────────────────────────────
 
     /// Submit a prediction for an open market by staking XLM on a chosen outcome.
+    ///
+    /// The predictor selects one of the market's valid `outcome_options` and
+    /// locks `stake_amount` stroops of XLM into escrow. Returns `AlreadyPredicted`
+    /// if the same address has already staked on this market. Emits a
+    /// `PredictionSubmitted` event on success.
     pub fn submit_prediction(
         env: Env,
         predictor: Address,
@@ -170,6 +232,10 @@ impl InsightArenaContract {
     }
 
     /// Return the stored [`Prediction`] for a given `(market_id, predictor)` pair.
+    ///
+    /// Read-only — no state is mutated. The prediction's TTL is extended on
+    /// every successful call. Returns `PredictionNotFound` if no prediction
+    /// exists for the supplied key.
     pub fn get_prediction(
         env: Env,
         market_id: u64,
@@ -178,17 +244,29 @@ impl InsightArenaContract {
         prediction::get_prediction(&env, market_id, predictor)
     }
 
-    /// Lightweight boolean check: has `predictor` already submitted a prediction?
+    /// Lightweight boolean check: has `predictor` already submitted a
+    /// prediction on `market_id`?
+    ///
+    /// Does not load the full `Prediction` struct — only tests key existence.
+    /// Never panics; returns `false` for non-existent markets or predictors.
     pub fn has_predicted(env: Env, market_id: u64, predictor: Address) -> bool {
         prediction::has_predicted(&env, market_id, predictor)
     }
 
     /// Return all [`Prediction`] records for a given market.
+    ///
+    /// Iterates the `PredictorList(market_id)` and fetches each prediction.
+    /// Returns an empty `Vec` when the market has no predictions or does not
+    /// exist. TTLs are extended for every record accessed.
     pub fn list_market_predictions(env: Env, market_id: u64) -> Vec<Prediction> {
         prediction::list_market_predictions(&env, market_id)
     }
 
     /// Claim a resolved-market payout for `predictor`.
+    ///
+    /// Reverts when the market is unresolved, the caller did not predict the
+    /// winning outcome, or a payout for this `(market_id, predictor)` has
+    /// already been claimed.
     pub fn claim_payout(
         env: Env,
         predictor: Address,
@@ -198,16 +276,23 @@ impl InsightArenaContract {
     }
 
     /// Return the current XLM balance held by the contract escrow in stroops.
+    ///
+    /// This is a pure view over the configured token contract and does not
+    /// mutate any internal state.
     pub fn get_contract_balance(env: Env) -> i128 {
         escrow::get_contract_balance(&env)
     }
 
-    /// Audit the contract's escrow solvency.
+    /// Audit the contract's escrow solvency against all unclaimed prediction
+    /// stakes currently stored on-chain.
     pub fn assert_escrow_solvent(env: Env) -> Result<(), InsightArenaError> {
         escrow::assert_escrow_solvent(&env)
     }
 
-    /// Batch distribute payouts for all unclaimed winning predictions.
+    /// Batch distribute payouts for all unclaimed winning predictions in a
+    /// resolved market. Callable only by admin or oracle.
+    ///
+    /// Returns the number of winner payouts processed in this invocation.
     pub fn batch_distribute_payouts(
         env: Env,
         caller: Address,
@@ -243,13 +328,30 @@ impl InsightArenaContract {
     }
 
     /// Return the total protocol fees accumulated in the treasury.
+    /// Returns `0` if no fees have been collected yet. Never panics.
     pub fn get_treasury_balance(env: Env) -> i128 {
         escrow::get_treasury_balance(&env)
+    }
+
+    /// Withdraw an amount from the accumulated protocol treasury.
+    ///
+    /// Caller must be the configured admin.
+    pub fn withdraw_treasury(
+        env: Env,
+        admin: Address,
+        to: Address,
+        amount: i128,
+    ) -> Result<(), InsightArenaError> {
+        escrow::transfer_fee(&env, &admin, &to, amount)
     }
 
     // ── Invite ────────────────────────────────────────────────────────────────
 
     /// Generate a unique 8-character invite code for a private market.
+    ///
+    /// Validation:
+    /// 1. `creator` must be the actual market creator.
+    /// 2. `max_uses` must be at least 1.
     pub fn generate_invite_code(
         env: Env,
         creator: Address,
@@ -258,6 +360,7 @@ impl InsightArenaContract {
         expires_in_seconds: u64,
     ) -> Result<Symbol, InsightArenaError> {
         invite::generate_invite_code(env, creator, market_id, max_uses, expires_in_seconds)
+        // ── Season / Leaderboard ────────────────────────────────────────────────
     }
 
     /// Redeem a private-market invite code and return the associated market id.
@@ -269,12 +372,24 @@ impl InsightArenaContract {
         invite::redeem_invite_code(env, invitee, code)
     }
 
-    // ── Season / Leaderboard ────────────────────────────────────────────────
+    /// Revoke an invite code so it can no longer be redeemed.
+    pub fn revoke_invite_code(
+        env: Env,
+        creator: Address,
+        code: Symbol,
+    ) -> Result<(), InsightArenaError> {
+        invite::revoke_invite_code(env, creator, code)
+    }
 
     /// List all season IDs which have snapshots available.
     pub fn list_snapshot_seasons(env: Env) -> Vec<u32> {
-        leaderboard::list_snapshot_seasons(&env)
+        env.storage()
+            .persistent()
+            .get(&DataKey::SnapshotSeasonList)
+            .unwrap_or_else(|| Vec::new(&env))
     }
+
+    // ── Season Management ─────────────────────────────────────────────────────
 
     pub fn create_season(
         env: Env,
@@ -303,8 +418,18 @@ impl InsightArenaContract {
         config::ensure_not_paused(&env)?;
         season::update_leaderboard(&env, admin, season_id, entries)?;
 
-        // Update SnapshotSeasonList via leaderboard logic
-        leaderboard::register_season_snapshot(&env, season_id);
+        // Update SnapshotSeasonList
+        let list_key = DataKey::SnapshotSeasonList;
+        let mut seasons: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&list_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if !seasons.contains(season_id) {
+            seasons.push_back(season_id);
+            env.storage().persistent().set(&list_key, &seasons);
+        }
 
         Ok(())
     }
@@ -330,6 +455,12 @@ impl InsightArenaContract {
         new_season_id: u32,
     ) -> Result<u32, InsightArenaError> {
         season::reset_season_points(&env, admin, new_season_id)
+    }
+
+    /// Season points for `user` in `season_id` (snapshot if finalized, else live profile when applicable).
+    /// Returns `0` for unknown users. Never panics.
+    pub fn get_user_season_points(env: Env, user: Address, season_id: u32) -> u32 {
+        leaderboard::get_user_season_points(&env, user, season_id)
     }
 
     // ── Reputation ────────────────────────────────────────────────────────────
@@ -370,13 +501,20 @@ impl InsightArenaContract {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+//
+// Soroban storage can only be accessed from within a registered contract context.
+// These tests use the auto-generated `InsightArenaContractClient` (available when
+// the `testutils` feature is enabled) to call through the real ABI and exercise
+// `ensure_not_paused` indirectly via `get_config`, which is guarded by it.
 
 #[cfg(test)]
 mod config_tests {
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::{Address, Env};
+
     use super::{InsightArenaContract, InsightArenaContractClient, InsightArenaError};
 
+    /// Register a fresh contract instance and return its client.
     fn deploy(env: &Env) -> InsightArenaContractClient<'_> {
         let id = env.register(InsightArenaContract, ());
         InsightArenaContractClient::new(env, &id)
@@ -388,6 +526,7 @@ mod config_tests {
             .address()
     }
 
+    // (a) Contract initialised and not paused → get_config (guarded) succeeds
     #[test]
     fn ensure_not_paused_ok_when_running() {
         let env = Env::default();
@@ -395,10 +534,14 @@ mod config_tests {
         let client = deploy(&env);
         let admin = Address::generate(&env);
         let oracle = Address::generate(&env);
+
         client.initialize(&admin, &oracle, &200_u32, &register_token(&env));
+
+        // get_config is the first publicly guarded function; passing means Ok(())
         client.get_config();
     }
 
+    // (b) Admin sets paused = true → get_config reverts with Paused
     #[test]
     fn ensure_not_paused_err_when_paused() {
         let env = Env::default();
@@ -406,21 +549,27 @@ mod config_tests {
         let client = deploy(&env);
         let admin = Address::generate(&env);
         let oracle = Address::generate(&env);
+
         client.initialize(&admin, &oracle, &200_u32, &register_token(&env));
         client.set_paused(&true);
+
+        // try_* variant returns Err(Ok(ContractError)) instead of panicking
         let result = client.try_get_config();
         assert!(matches!(result, Err(Ok(InsightArenaError::Paused))));
     }
 
+    // Edge case: guard returns NotInitialized when the contract hasn't been set up
     #[test]
     fn ensure_not_paused_not_initialized() {
         let env = Env::default();
         env.mock_all_auths();
         let client = deploy(&env);
+
         let result = client.try_get_config();
         assert!(matches!(result, Err(Ok(InsightArenaError::NotInitialized))));
     }
 
+    // Unpause after pause → guard passes again
     #[test]
     fn ensure_not_paused_ok_after_unpause() {
         let env = Env::default();
@@ -428,9 +577,12 @@ mod config_tests {
         let client = deploy(&env);
         let admin = Address::generate(&env);
         let oracle = Address::generate(&env);
+
         client.initialize(&admin, &oracle, &200_u32, &register_token(&env));
         client.set_paused(&true);
         client.set_paused(&false);
+
+        // Must succeed after resuming
         client.get_config();
     }
 }
@@ -439,6 +591,7 @@ mod config_tests {
 mod leaderboard_tests {
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::{vec, Address, Env};
+
     use super::{
         InsightArenaContract, InsightArenaContractClient, InsightArenaError, LeaderboardEntry,
     };
@@ -462,8 +615,11 @@ mod leaderboard_tests {
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin, xlm_token) = deploy(&env);
+
+        // Creator needs to fund and approve for season reward pool
         let reward_pool = 10_000_000;
         let token_client = soroban_sdk::token::Client::new(&env, &xlm_token);
+        Address::generate(&env); // dummy
         soroban_sdk::token::StellarAssetClient::new(&env, &xlm_token).mint(&admin, &reward_pool);
         token_client.approve(&admin, &client.address, &reward_pool, &9999);
 
@@ -489,9 +645,14 @@ mod leaderboard_tests {
         ];
 
         client.update_leaderboard(&admin, &season_id, &entries);
+
         let snapshot = client.get_leaderboard(&season_id);
         assert_eq!(snapshot.season_id, season_id);
         assert_eq!(snapshot.entries.len(), 2);
+        assert_eq!(snapshot.entries.get(0).unwrap().user, user1);
+        assert_eq!(snapshot.entries.get(0).unwrap().points, 100);
+        assert_eq!(snapshot.entries.get(1).unwrap().user, user2);
+        assert_eq!(snapshot.entries.get(1).unwrap().points, 80);
     }
 
     #[test]
@@ -499,20 +660,45 @@ mod leaderboard_tests {
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin, xlm_token) = deploy(&env);
+
         let reward_pool = 20_000_000;
         soroban_sdk::token::StellarAssetClient::new(&env, &xlm_token).mint(&admin, &reward_pool);
-        soroban_sdk::token::Client::new(&env, &xlm_token).approve(&admin, &client.address, &reward_pool, &9999);
+        soroban_sdk::token::Client::new(&env, &xlm_token).approve(
+            &admin,
+            &client.address,
+            &reward_pool,
+            &9999,
+        );
 
         let s1 = client.create_season(&admin, &100, &200, &10_000_000);
         let s2 = client.create_season(&admin, &201, &300, &10_000_000);
-        let entries = vec![&env, LeaderboardEntry { rank: 1, user: Address::generate(&env), points: 10, correct_predictions: 1, total_predictions: 1 }];
 
+        assert_eq!(client.list_snapshot_seasons().len(), 0);
+
+        let entries = vec![
+            &env,
+            LeaderboardEntry {
+                rank: 1,
+                user: Address::generate(&env),
+                points: 10,
+                correct_predictions: 1,
+                total_predictions: 1,
+            },
+        ];
+
+        // First snapshot for Season 1 (admin)
         client.update_leaderboard(&admin, &s1, &entries);
         assert_eq!(client.list_snapshot_seasons().len(), 1);
+        assert_eq!(client.list_snapshot_seasons().get(0).unwrap(), s1);
+
+        // Update Snapshot for Season 1 (admin) — should not duplicate in list
         client.update_leaderboard(&admin, &s1, &entries);
         assert_eq!(client.list_snapshot_seasons().len(), 1);
+
+        // Snapshot for Season 2
         client.update_leaderboard(&admin, &s2, &entries);
         assert_eq!(client.list_snapshot_seasons().len(), 2);
+        assert_eq!(client.list_snapshot_seasons().get(1).unwrap(), s2);
     }
 
     #[test]
@@ -520,6 +706,7 @@ mod leaderboard_tests {
         let env = Env::default();
         env.mock_all_auths();
         let (client, _, _) = deploy(&env);
+
         let result = client.try_get_leaderboard(&99);
         assert!(matches!(result, Err(Ok(InsightArenaError::SeasonNotFound))));
     }
@@ -530,6 +717,7 @@ mod leaderboard_tests {
         env.mock_all_auths();
         let (client, _, _) = deploy(&env);
         let stranger = Address::generate(&env);
+
         let result = client.try_update_leaderboard(&stranger, &1, &vec![&env]);
         assert!(matches!(result, Err(Ok(InsightArenaError::Unauthorized))));
     }
@@ -539,8 +727,15 @@ mod leaderboard_tests {
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin, _) = deploy(&env);
+
         client.set_paused(&true);
         let result = client.try_update_leaderboard(&admin, &1, &vec![&env]);
         assert!(matches!(result, Err(Ok(InsightArenaError::Paused))));
     }
 }
+
+#[cfg(test)]
+mod season_tests;
+
+#[cfg(test)]
+mod prediction_tests;
