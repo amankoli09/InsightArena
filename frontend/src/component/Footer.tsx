@@ -39,6 +39,7 @@ export default function Footer() {
         { name: "Discord", href: "https://discord.gg/InsightArena" },
         { name: "Contact Support", href: "/contact" },
         { name: "Terms of Service", href: "/terms" },
+        { name: "Privacy Policy", href: "/privacy" },
       ],
     },
   ];
